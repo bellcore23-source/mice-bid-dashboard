@@ -1,27 +1,35 @@
 """
 collector.py
 ────────────
-나라장터 OpenAPI에서 MICE 관련 입찰공고를 수집·정제하는 데이터 수집 엔진.
+나라장터 OpenAPI에서 MICE 관련 입찰공고를 수집·정제하고 Supabase(PostgreSQL)에 적재하는 엔진.
 
 주요 흐름:
-  1. API 호출 → 페이지네이션 처리로 전체 데이터 수집
-  2. Positive/Negative 키워드 필터 적용
+  1. API 호출 → 페이지네이션 처리로 전체 데이터 수집 (데모 데이터 폴백 지원)
+  2. 2단계 필터링 적용 (Positive 검색 후 Negative 키워드 차단)
   3. 마감 상태 판별 (bidClsDt 누락 시 opengDt 기준 폴백)
   4. 금액 구간화 컬럼 추가
-  5. Pandas DataFrame으로 반환
+  5. Supabase(PostgreSQL)에 Upsert (중복 방지)
 """
 
 from __future__ import annotations
 
 import logging
+import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
 import requests
+from supabase import create_client, Client
 
 import config
 
+# 로깅 기본 설정
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stdout
+)
 logger = logging.getLogger(__name__)
 
 # 한국 표준시 (UTC+9)
@@ -33,7 +41,6 @@ COLUMNS = [
     "bidClsDt", "asignBdgtAmt", "bidMethdNm", "opengDt", "status",
     "budgetRange", "detailUrl"
 ]
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -48,13 +55,13 @@ def _now_kst() -> datetime:
 def _parse_dt(raw: str | None) -> datetime | None:
     """
     나라장터 API의 다양한 날짜 포맷을 파싱하여 KST datetime 반환.
-    지원 포맷: 'YYYYMMDDHHMMSS', 'YYYY-MM-DD HH:MM:SS'
+    지원 포맷: 'YYYYMMDDHHMMSS', 'YYYY-MM-DD HH:MM:SS', 'YYYY-MM-DD HH:MM', 'YYYYMMDD'
     파싱 실패 시 None 반환.
     """
     if not raw:
         return None
     raw = raw.strip()
-    for fmt in ("%Y%m%d%H%M%S", "%Y-%m-%d %H:%M:%S", "%Y%m%d"):
+    for fmt in ("%Y%m%d%H%M%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y%m%d"):
         try:
             dt = datetime.strptime(raw, fmt)
             return dt.replace(tzinfo=KST)
@@ -101,18 +108,6 @@ def _fetch_page(
 ) -> dict[str, Any]:
     """
     나라장터 OpenAPI 단일 페이지 호출.
-
-    Parameters
-    ----------
-    service_key : 공공데이터포털 인증키 (URL 인코딩 전 원문)
-    page_no     : 페이지 번호 (1-based)
-    start_date  : 게시일 시작 (YYYYMMDD)
-    end_date    : 게시일 종료 (YYYYMMDD)
-    keyword     : 검색 키워드 (공고명 기준)
-
-    Returns
-    -------
-    dict : API 응답 전체 body
     """
     params = {
         "serviceKey":  service_key,
@@ -168,8 +163,8 @@ def _determine_status(row: dict[str, Any]) -> str:
     """
     마감 상태 판별 로직.
 
-    - bidClsDt(입찰마감일시) 존재 → 해당 시각 기준
-    - bidClsDt 누락 → opengDt(개찰일시) 기준 폴백
+    - bidClsDt(입찰마감일시) 존재 → 해당 시각 기준 마감 여부 판별
+    - bidClsDt 누락 → opengDt(개찰일시) 기준 폴백 판별
     - 기준 시각을 알 수 없는 경우 → '정보없음'
     """
     now = _now_kst()
@@ -205,7 +200,7 @@ def _build_detail_url(row: dict[str, Any]) -> str:
 
 def _clean_item(raw: dict[str, Any]) -> dict[str, Any]:
     """
-    API 원문 item 하나를 대시보드용 레코드로 변환.
+    API 원문 item 하나를 정제된 레코드로 변환.
     """
     amount = _clean_amount(raw.get("asignBdgtAmt"))
     status = _determine_status(raw)
@@ -219,7 +214,7 @@ def _clean_item(raw: dict[str, Any]) -> dict[str, Any]:
         "bidNtceNm":    raw.get("bidNtceNm", "").strip(),
         "ntceInsttNm":  raw.get("ntceInsttNm", "").strip(),
         "bidNtceDt":    ntce_dt.strftime("%Y-%m-%d") if ntce_dt else "",
-        "bidClsDt":     cls_dt.strftime("%Y-%m-%d %H:%M")  if cls_dt  else "",
+        "bidClsDt":     cls_dt.strftime("%Y-%m-%d %H:%M") if cls_dt else "",
         "asignBdgtAmt": amount,
         "bidMethdNm":   raw.get("bidMethdNm", ""),
         "opengDt":      raw.get("opengDt", ""),
@@ -239,19 +234,10 @@ def fetch_mice_bids(
 ) -> pd.DataFrame:
     """
     나라장터 OpenAPI에서 MICE 관련 입찰공고를 수집하여 DataFrame으로 반환.
-
-    Parameters
-    ----------
-    api_key     : 공공데이터포털 인증키. None이면 config.API_KEY 사용.
-    period_days : 조회 기간 (현재일 기준 과거 일수, 기본 90일).
-
-    Returns
-    -------
-    pd.DataFrame : 정제된 입찰공고 데이터프레임. 오류 발생 시 빈 DataFrame.
     """
     service_key = api_key or config.API_KEY
-    if not service_key:
-        logger.warning("API 키가 설정되지 않았습니다. 데모 데이터를 반환합니다.")
+    if not service_key or service_key == "your_api_key_here":
+        logger.warning("API 키가 설정되지 않았거나 기본값입니다. 데모 데이터를 반환합니다.")
         return _load_demo_data()
 
     now      = _now_kst()
@@ -282,7 +268,7 @@ def fetch_mice_bids(
         logger.warning("수집된 공고가 없습니다.")
         return pd.DataFrame(columns=COLUMNS)
 
-    # 공고번호 기준 중복 제거
+    # 1단계: 공고번호 + 공고차수 기준 중복 제거
     seen: set[str] = set()
     unique_items: list[dict[str, Any]] = []
     for item in all_items:
@@ -291,14 +277,16 @@ def fetch_mice_bids(
             seen.add(key)
             unique_items.append(item)
 
-    # 공고명 Positive 재검증 + Negative 필터
+    # 2단계: 공고명 Positive 재검증 + Negative 필터링 (공사, 구축, 리모델링 등 제외)
     filtered: list[dict[str, Any]] = []
     for item in unique_items:
         nm = item.get("bidNtceNm", "")
+        # Positive 키워드가 공고명에 매칭되는지 확인
         if not _contains_any(nm, config.POSITIVE_KEYWORDS):
             continue
+        # Negative 키워드가 들어있는 경우 차단
         if _contains_any(nm, config.NEGATIVE_KEYWORDS):
-            logger.debug("Negative 필터 제외: %s", nm)
+            logger.info("Negative 필터 제외: %s", nm)
             continue
         filtered.append(item)
 
@@ -323,8 +311,7 @@ def fetch_mice_bids(
 
 def _load_demo_data() -> pd.DataFrame:
     """
-    API 키 없이도 UI를 확인할 수 있도록 정적 샘플 데이터를 반환.
-    실제 운영 환경에서는 사용되지 않음.
+    API 키 없이도 동작 확인이 가능하도록 데모 데이터 반환.
     """
     from datetime import date
 
@@ -448,3 +435,72 @@ def _load_demo_data() -> pd.DataFrame:
     df.sort_values("bidNtceDt", ascending=False, inplace=True)
     df.reset_index(drop=True, inplace=True)
     return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 메인 실행 블록
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_collector():
+    """수집 및 Supabase 적재 메인 함수."""
+    logger.info("========================================")
+    logger.info("MICE Bidding Collector 실행 시작")
+    logger.info("========================================")
+
+    # 1. API 데이터 수집
+    df = fetch_mice_bids()
+    if df.empty:
+        logger.warning("수집 또는 정제된 공고 데이터가 없습니다.")
+        return
+
+    logger.info(f"총 {len(df)}건의 정제된 공고 수집 완료.")
+
+    # 2. Supabase 설정 확인
+    if not config.SUPABASE_URL or not config.SUPABASE_KEY or \
+            config.SUPABASE_URL == "your_supabase_url_here" or \
+            config.SUPABASE_KEY == "your_supabase_anon_key_here":
+        logger.error("Supabase 연결 정보가 누락되었거나 placeholder 상태입니다.")
+        logger.error(".env 파일에 올바른 SUPABASE_URL 및 SUPABASE_KEY를 작성해 주세요.")
+        return
+
+    # 3. Supabase 적재 데이터 매핑
+    records = df.to_dict(orient="records")
+    db_items = []
+    for item in records:
+        db_items.append({
+            "id": f"{item['bidNtceNo']}-{item['bidNtceOrd']}",
+            "bid_ntce_no": str(item["bidNtceNo"]),
+            "bid_ntce_ord": str(item["bidNtceOrd"]),
+            "bid_ntce_nm": str(item["bidNtceNm"]),
+            "ntce_instt_nm": str(item["ntceInsttNm"]) if item.get("ntceInsttNm") else None,
+            "bid_ntce_dt": str(item["bidNtceDt"]) if item.get("bidNtceDt") else None,
+            "bid_cls_dt": str(item["bidClsDt"]) if item.get("bidClsDt") else None,
+            "asign_bdgt_amt": item["asignBdgtAmt"],
+            "bid_methd_nm": str(item["bidMethdNm"]) if item.get("bidMethdNm") else None,
+            "openg_dt": str(item["opengDt"]) if item.get("opengDt") else None,
+            "status": str(item["status"]),
+            "budget_range": str(item["budgetRange"]),
+            "detail_url": str(item["detailUrl"]),
+        })
+
+    # 4. Supabase Upsert 수행
+    try:
+        supabase: Client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
+        logger.info(f"Supabase 연결 성공. 적재 진행 중... (총 {len(db_items)}건)")
+
+        # 100건씩 배치 처리
+        batch_size = 100
+        for i in range(0, len(db_items), batch_size):
+            batch = db_items[i:i + batch_size]
+            supabase.table("tenders").upsert(batch).execute()
+            logger.info(f"  배치 적재 완료: {i + len(batch)} / {len(db_items)}")
+
+        logger.info("========================================")
+        logger.info("MICE Bidding Collector 적재 성공!")
+        logger.info("========================================")
+    except Exception as e:
+        logger.error(f"Supabase Upsert 작업 중 치명적 오류 발생: {e}")
+
+
+if __name__ == "__main__":
+    run_collector()

@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── API 기본 설정 ─────────────────────────────────────────────────────────────
+# ── API 및 데이터베이스 설정 ──────────────────────────────────────────────────
 API_KEY: str = os.getenv("NARA_API_KEY", "")
 BASE_URL: str = (
     "https://apis.data.go.kr/1230000/ad/BidPublicInfoService"
@@ -19,6 +19,10 @@ BASE_URL: str = (
 PAGE_SIZE: int = 100          # 1회 호출 당 최대 수신 건수
 MAX_PAGES: int = 30           # 무한 루프 방지를 위한 최대 페이지 수
 REQUEST_TIMEOUT: int = 20     # 초 단위
+
+# Supabase 설정
+SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY: str = os.getenv("SUPABASE_KEY", "")
 
 # ── 검색 기간 기본값 ─────────────────────────────────────────────────────────
 DEFAULT_PERIOD_DAYS: int = 90  # 기본 90일(3개월)
