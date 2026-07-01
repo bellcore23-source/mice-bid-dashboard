@@ -346,7 +346,8 @@ def _apply_filters(
     keyword: str,
     period_days: int,
 ) -> pd.DataFrame:
-    """사이드바 필터를 DataFrame에 적용하여 필터링된 복사본 반환."""
+    if df is None or df.empty:
+        return df
     result = df.copy()
 
     # 기간 필터 (게시일자 기준)

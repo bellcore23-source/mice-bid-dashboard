@@ -27,6 +27,14 @@ logger = logging.getLogger(__name__)
 # 한국 표준시 (UTC+9)
 KST = timezone(timedelta(hours=9))
 
+# 기본 DataFrame 컬럼 정의 (KeyError 방지용)
+COLUMNS = [
+    "bidNtceNo", "bidNtceOrd", "bidNtceNm", "ntceInsttNm", "bidNtceDt",
+    "bidClsDt", "asignBdgtAmt", "bidMethdNm", "opengDt", "status",
+    "budgetRange", "detailUrl"
+]
+
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 내부 유틸 함수
@@ -272,7 +280,7 @@ def fetch_mice_bids(
 
     if not all_items:
         logger.warning("수집된 공고가 없습니다.")
-        return pd.DataFrame()
+        return pd.DataFrame(columns=COLUMNS)
 
     # 공고번호 기준 중복 제거
     seen: set[str] = set()
@@ -297,7 +305,7 @@ def fetch_mice_bids(
     logger.info("필터링 완료: %d건 → %d건", len(unique_items), len(filtered))
 
     records = [_clean_item(item) for item in filtered]
-    df = pd.DataFrame(records)
+    df = pd.DataFrame(records, columns=COLUMNS)
 
     if df.empty:
         return df
