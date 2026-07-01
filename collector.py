@@ -241,8 +241,8 @@ def fetch_mice_bids(
         return _load_demo_data()
 
     now      = _now_kst()
-    end_dt   = now.strftime("%Y%m%d%H%M%S")
-    start_dt = (now - timedelta(days=period_days)).strftime("%Y%m%d%H%M%S")
+    end_dt   = now.strftime("%Y%m%d%H%M")
+    start_dt = (now - timedelta(days=period_days)).strftime("%Y%m%d%H%M")
 
     all_items: list[dict[str, Any]] = []
 
